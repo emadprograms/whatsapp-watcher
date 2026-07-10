@@ -294,6 +294,39 @@ To start watching a group, run:`);
             fsWatcher.on('add', (filePath) => {
                 enqueueUpload(filePath);
             });
+
+            fsWatcher.on('unlink', async (filePath) => {
+                const filename = path.basename(filePath);
+                if (
+                    filename === 'sync-manifest.json' ||
+                    filename === 'skipped-files.log' ||
+                    filename.endsWith('.tmp')
+                ) {
+                    return;
+                }
+                if (!manifest.has(filename)) return;
+
+                const messageId = manifest.getByFilename(filename);
+                try {
+                    const msg = await client.getMessageById(messageId);
+                    if (msg) {
+                        await msg.delete(true);
+                        console.log(
+                            '🗑️ Revoked WhatsApp message for deleted file:',
+                            filename,
+                        );
+                    }
+                } catch (err) {
+                    console.error(
+                        '❌ Error revoking message for deleted file',
+                        filename,
+                        ':',
+                        err,
+                    );
+                } finally {
+                    manifest.delete(filename);
+                }
+            });
         } catch (err) {
             console.error('❌ Failed to initialize chokidar watcher:', err);
         }
