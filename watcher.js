@@ -225,6 +225,7 @@ To start watching a group, run:`);
 
         async function processUploadQueue() {
             isProcessingQueue = true;
+            let consecutiveUploads = 0;
             while (uploadQueue.length > 0) {
                 const filePath = uploadQueue.shift();
                 const filename = path.basename(filePath);
@@ -243,16 +244,51 @@ To start watching a group, run:`);
                     }
 
                     const media = MessageMedia.fromFilePath(filePath);
-                    const sentMsg = await client.sendMessage(
-                        TARGET_GROUP_ID,
-                        media,
-                        {
-                            caption: filename,
-                        },
-                    );
-                    manifest.set(filename, sentMsg.id._serialized);
-                    console.log('✅ Uploaded:', filename);
-                    await new Promise((r) => setTimeout(r, 3000));
+                    let attempts = 0;
+                    let success = false;
+                    const MAX_RETRIES = 3;
+
+                    while (attempts < MAX_RETRIES && !success) {
+                        try {
+                            const sentMsg = await client.sendMessage(
+                                TARGET_GROUP_ID,
+                                media,
+                                {
+                                    caption: filename,
+                                },
+                            );
+                            manifest.set(filename, sentMsg.id._serialized);
+                            console.log('✅ Uploaded:', filename);
+                            success = true;
+                        } catch (uploadErr) {
+                            attempts++;
+                            if (attempts >= MAX_RETRIES) {
+                                throw uploadErr;
+                            }
+                            console.warn(
+                                `⚠️ Upload failed for ${filename}. Retrying (${attempts}/${MAX_RETRIES})...`,
+                            );
+                            await new Promise((r) =>
+                                setTimeout(r, Math.pow(2, attempts) * 1000),
+                            );
+                        }
+                    }
+                    consecutiveUploads++;
+                    if (
+                        consecutiveUploads % 10 === 0 &&
+                        uploadQueue.length > 0
+                    ) {
+                        console.log(
+                            `⏱️ Rate limit: Pausing for 60 seconds after ${consecutiveUploads} consecutive uploads...`,
+                        );
+                        await new Promise((r) => setTimeout(r, 60000));
+                    } else if (uploadQueue.length > 0) {
+                        if (consecutiveUploads >= 10) {
+                            await new Promise((r) => setTimeout(r, 10000));
+                        } else {
+                            await new Promise((r) => setTimeout(r, 3000));
+                        }
+                    }
                 } catch (err) {
                     fs.appendFileSync(
                         path.join(groupFolder, 'skipped-files.log'),
