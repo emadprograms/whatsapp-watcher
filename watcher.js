@@ -281,6 +281,15 @@ To start watching a group, run:`);
             }
         }
 
+        if (uploadQueue.length > 0 && !isProcessingQueue) {
+            console.log(
+                `▶️ Starting upload queue with ${uploadQueue.length} offline files...`,
+            );
+            processUploadQueue(groupFolder).catch((err) =>
+                console.error('❌ Startup upload queue error:', err),
+            );
+        }
+
         try {
             const chokidar = await import('chokidar');
             const fsWatcher = chokidar.watch(groupFolder, {
@@ -331,12 +340,6 @@ To start watching a group, run:`);
             });
         } catch (err) {
             console.error('❌ Failed to initialize chokidar watcher:', err);
-        }
-
-        if (uploadQueue.length > 0) {
-            processUploadQueue().catch((err) =>
-                console.error('❌ Startup upload queue error:', err),
-            );
         }
 
         console.log('Waiting for new media messages...');
