@@ -26,6 +26,7 @@ const DOWNLOADS_DIR = path.join(__dirname, 'downloads');
 
 let manifest = null;
 let isWatcherInitialized = false;
+let groupFolder = null;
 
 if (!fs.existsSync(DOWNLOADS_DIR)) {
     fs.mkdirSync(DOWNLOADS_DIR);
@@ -114,10 +115,7 @@ To start watching a group, run:`);
     } else {
         console.log(`Watching group: ${TARGET_GROUP_ID}`);
 
-        const groupFolder = path.join(
-            DOWNLOADS_DIR,
-            TARGET_GROUP_ID.split('@')[0],
-        );
+        groupFolder = path.join(DOWNLOADS_DIR, TARGET_GROUP_ID.split('@')[0]);
         if (!fs.existsSync(groupFolder))
             fs.mkdirSync(groupFolder, { recursive: true });
         manifest = new SyncManifest(
@@ -341,6 +339,39 @@ To start watching a group, run:`);
     }
 });
 
+async function handleRevocation(msg, revokedMsg) {
+    if (msg.from !== TARGET_GROUP_ID && msg.to !== TARGET_GROUP_ID) return;
+
+    const messageId = msg.id._serialized;
+    let filename = manifest.getByMessageId(messageId);
+
+    if (!filename && revokedMsg) {
+        filename = manifest.getByMessageId(revokedMsg.id._serialized);
+    }
+
+    if (!filename) return;
+
+    const filePath = path.join(groupFolder, filename);
+    try {
+        if (fs.existsSync(filePath)) {
+            fs.unlinkSync(filePath);
+            console.log('🗑️ Deleted local file for revoked message:', filename);
+        }
+    } catch (err) {
+        console.error(
+            '❌ Error deleting local file for revoked message',
+            filename,
+            ':',
+            err,
+        );
+    } finally {
+        manifest.delete(filename);
+    }
+}
+
+client.on('message_revoke_everyone', handleRevocation);
+client.on('message_revoke_me', handleRevocation);
+
 client.on('message_create', async (msg) => {
     if (msg.id.fromMe) return;
     console.log(
@@ -358,10 +389,6 @@ client.on('message_create', async (msg) => {
             const media = await msg.downloadMedia();
 
             if (media) {
-                const groupFolder = path.join(
-                    DOWNLOADS_DIR,
-                    TARGET_GROUP_ID.split('@')[0],
-                );
                 if (!fs.existsSync(groupFolder)) {
                     fs.mkdirSync(groupFolder, { recursive: true });
                 }
