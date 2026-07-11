@@ -198,7 +198,7 @@ To start watching a group, run:`);
         console.log('🔍 Scanning for offline changes...');
         const startupUploadQueue = [];
 
-        // 1. Detect offline file deletions (Tracked in manifest but missing locally)
+        // 1a. Detect offline file deletions (Tracked in manifest but missing locally)
         for (const [filename, messageId] of manifest.entries()) {
             try {
                 if (!fs.existsSync(path.join(groupFolder, filename))) {
@@ -221,6 +221,32 @@ To start watching a group, run:`);
                 );
             }
         }
+
+        // 1b. Reverse-check: verify each manifest entry still exists on WhatsApp
+        for (const [filename, messageId] of manifest.entries()) {
+            try {
+                const msg = await client.getMessageById(messageId);
+                if (!msg || msg.type === 'revoked' || !msg.hasMedia) {
+                    const filePath = path.join(groupFolder, filename);
+                    if (fs.existsSync(filePath)) {
+                        fs.unlinkSync(filePath);
+                    }
+                    manifest.delete(filename);
+                    console.log(
+                        '🗑️ Removed file for revoked/missing WA message:',
+                        filename,
+                    );
+                }
+            } catch (err) {
+                console.error(
+                    '❌ Error checking manifest entry for',
+                    filename,
+                    ':',
+                    err,
+                );
+            }
+        }
+        console.log('✅ Reverse manifest check complete.');
 
         // 2. Detect offline file additions (Local files not tracked in manifest)
         const localFiles = fs.readdirSync(groupFolder);
