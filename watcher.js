@@ -3,6 +3,7 @@ const qrcode = require('qrcode-terminal');
 const fs = require('fs');
 const path = require('path');
 require('dotenv').config();
+const mime = require('mime');
 
 // ... (existing imports)
 const SyncManifest = require('./src/SyncManifest');
@@ -27,7 +28,6 @@ const DOWNLOADS_DIR = path.join(__dirname, 'sync_download');
 let manifest = null;
 let isWatcherInitialized = false;
 let groupFolder = null;
-const pendingUploadIds = new Set(); // tracks in-flight bot uploads for echo prevention
 const uploadingFiles = new Set(); // Tracks captions/filenames actively being uploaded
 
 if (!fs.existsSync(DOWNLOADS_DIR)) {
@@ -52,6 +52,9 @@ const client = new Client({
 // Graceful shutdown: kill browser when user presses Ctrl+C
 process.on('SIGINT', async () => {
     console.log('\n🛑 Stopping watcher...');
+    if (client) {
+        await client.destroy();
+    }
     process.exit(0);
 });
 
@@ -216,13 +219,17 @@ To start watching a group, run:`);
                             );
                             try {
                                 fs.renameSync(filePath, newFilePath);
+                                manifest.set(
+                                    newFilename,
+                                    sentMsg.id._serialized,
+                                );
                             } catch (renameErr) {
                                 console.warn(
                                     `⚠️ Could not rename ${filename} to ${newFilename}:`,
                                     renameErr.message,
                                 );
+                                manifest.set(filename, sentMsg.id._serialized);
                             }
-                            manifest.set(newFilename, sentMsg.id._serialized);
                             console.log(
                                 `✅ Uploaded: ${filename} → saved as ${newFilename}`,
                             );
@@ -348,10 +355,10 @@ To start watching a group, run:`);
             let downloadedCount = 0;
             for (const msg of messages) {
                 if (msg.hasMedia) {
+                    if (manifest.getByMessageId(msg.id._serialized)) continue;
                     const media = await msg.downloadMedia();
                     if (media) {
                         let baseFilename = media.filename;
-                        const mime = require('mime');
                         const mimetypeStr = media.mimetype
                             ? media.mimetype.split(';')[0]
                             : '';
@@ -420,8 +427,8 @@ To start watching a group, run:`);
 
         // 1a. Detect offline file deletions (Tracked in manifest but missing locally)
         for (const [filename, messageId] of manifest.entries()) {
-            try {
-                if (!fs.existsSync(path.join(groupFolder, filename))) {
+            if (!fs.existsSync(path.join(groupFolder, filename))) {
+                try {
                     const msg = await client.getMessageById(messageId);
                     if (msg) {
                         await msg.delete(true);
@@ -430,43 +437,21 @@ To start watching a group, run:`);
                             filename,
                         );
                     }
+                } catch (err) {
+                    console.error(
+                        '❌ Error processing offline deletion for',
+                        filename,
+                        ':',
+                        err.message,
+                    );
+                } finally {
                     manifest.delete(filename);
                 }
-            } catch (err) {
-                console.error(
-                    '❌ Error processing offline deletion for',
-                    filename,
-                    ':',
-                    err,
-                );
             }
         }
 
         // 1b. Reverse-check: verify each manifest entry still exists on WhatsApp
-        for (const [filename, messageId] of manifest.entries()) {
-            try {
-                const msg = await client.getMessageById(messageId);
-                if (!msg || msg.type === 'revoked' || !msg.hasMedia) {
-                    const filePath = path.join(groupFolder, filename);
-                    if (fs.existsSync(filePath)) {
-                        fs.unlinkSync(filePath);
-                    }
-                    manifest.delete(filename);
-                    console.log(
-                        '🗑️ Removed file for revoked/missing WA message:',
-                        filename,
-                    );
-                }
-            } catch (err) {
-                console.error(
-                    '❌ Error checking manifest entry for',
-                    filename,
-                    ':',
-                    err,
-                );
-            }
-        }
-        console.log('✅ Reverse manifest check complete.');
+        // Reverse-check disabled to prevent severe API spam
 
         // 2. Detect offline file additions (Local files not tracked in manifest)
         const localFiles = fs.readdirSync(groupFolder);
@@ -559,13 +544,12 @@ client.on('message_create', async (msg) => {
 
         if (
             msg.id.fromMe &&
-            (pendingUploadIds.has(msg.id._serialized) ||
-                (manifest && manifest.getByMessageId(msg.id._serialized)))
+            manifest &&
+            manifest.getByMessageId(msg.id._serialized)
         ) {
             console.log(
                 `🔄 Ignoring echo of our own upload: ${msg.id._serialized}`,
             );
-            pendingUploadIds.delete(msg.id._serialized);
             return;
         }
         try {
@@ -578,7 +562,6 @@ client.on('message_create', async (msg) => {
                 }
 
                 let baseFilename = media.filename;
-                const mime = require('mime');
                 const mimetypeStr = media.mimetype
                     ? media.mimetype.split(';')[0]
                     : '';
