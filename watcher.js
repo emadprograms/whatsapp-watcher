@@ -27,6 +27,7 @@ const DOWNLOADS_DIR = path.join(__dirname, 'downloads');
 let manifest = null;
 let isWatcherInitialized = false;
 let groupFolder = null;
+const pendingUploadIds = new Set(); // tracks in-flight bot uploads for echo prevention
 
 if (!fs.existsSync(DOWNLOADS_DIR)) {
     fs.mkdirSync(DOWNLOADS_DIR);
@@ -121,6 +122,191 @@ To start watching a group, run:`);
         manifest = new SyncManifest(
             path.join(groupFolder, 'sync-manifest.json'),
         );
+
+        // --- UPLOAD INFRASTRUCTURE ---
+        if (isWatcherInitialized) return;
+        isWatcherInitialized = true;
+
+        const MAX_FILE_SIZE_BYTES = 64 * 1024 * 1024;
+        const uploadQueue = [];
+        let isProcessingQueue = false;
+
+        const deleteQueue = [];
+        let isProcessingDeleteQueue = false;
+
+        async function processDeleteQueue() {
+            isProcessingDeleteQueue = true;
+            while (deleteQueue.length > 0) {
+                const filename = deleteQueue.shift();
+                const messageId = manifest.getByFilename(filename);
+                try {
+                    const msg = await client.getMessageById(messageId);
+                    if (msg) {
+                        await msg.delete(true);
+                        console.log(
+                            '🗑️ Revoked WhatsApp message for deleted file:',
+                            filename,
+                        );
+                    }
+                } catch (err) {
+                    console.error(
+                        '❌ Error revoking message for deleted file',
+                        filename,
+                        ':',
+                        err,
+                    );
+                } finally {
+                    manifest.delete(filename);
+                }
+            }
+            isProcessingDeleteQueue = false;
+        }
+
+        async function processUploadQueue() {
+            isProcessingQueue = true;
+            let consecutiveUploads = 0;
+            while (uploadQueue.length > 0) {
+                const filePath = uploadQueue.shift();
+                const filename = path.basename(filePath);
+
+                if (manifest.has(filename)) continue;
+                if (!fs.existsSync(filePath)) continue;
+
+                try {
+                    const stat = fs.statSync(filePath);
+                    if (stat.size > MAX_FILE_SIZE_BYTES) {
+                        fs.appendFileSync(
+                            path.join(groupFolder, 'skipped-files.log'),
+                            `${new Date().toISOString()} | SIZE_SKIP | ${filename} | ${stat.size} bytes exceeds ${MAX_FILE_SIZE_BYTES} limit\n`,
+                        );
+                        continue;
+                    }
+
+                    const media = MessageMedia.fromFilePath(filePath);
+                    let attempts = 0;
+                    let success = false;
+                    const MAX_RETRIES = 3;
+
+                    while (attempts < MAX_RETRIES && !success) {
+                        try {
+                            const sentMsg = await client.sendMessage(
+                                TARGET_GROUP_ID,
+                                media,
+                                {
+                                    caption: filename,
+                                },
+                            );
+                            manifest.set(filename, sentMsg.id._serialized);
+                            pendingUploadIds.add(sentMsg.id._serialized);
+                            console.log('✅ Uploaded:', filename);
+                            success = true;
+                        } catch (uploadErr) {
+                            attempts++;
+                            if (attempts >= MAX_RETRIES) {
+                                throw uploadErr;
+                            }
+                            console.warn(
+                                `⚠️ Upload failed for ${filename}. Retrying (${attempts}/${MAX_RETRIES})...`,
+                            );
+                            await new Promise((r) =>
+                                setTimeout(r, Math.pow(2, attempts) * 1000),
+                            );
+                        }
+                    }
+                    consecutiveUploads++;
+                    if (
+                        consecutiveUploads % 10 === 0 &&
+                        uploadQueue.length > 0
+                    ) {
+                        console.log(
+                            `⏱️ Rate limit: Pausing for 60 seconds after ${consecutiveUploads} consecutive uploads...`,
+                        );
+                        await new Promise((r) => setTimeout(r, 60000));
+                    } else if (uploadQueue.length > 0) {
+                        if (consecutiveUploads >= 10) {
+                            await new Promise((r) => setTimeout(r, 10000));
+                        } else {
+                            await new Promise((r) => setTimeout(r, 3000));
+                        }
+                    }
+                } catch (err) {
+                    fs.appendFileSync(
+                        path.join(groupFolder, 'skipped-files.log'),
+                        `${new Date().toISOString()} | SKIP | ${filename} | ${err.message}\n`,
+                    );
+                }
+            }
+            isProcessingQueue = false;
+        }
+
+        function enqueueUpload(filePath) {
+            const filename = path.basename(filePath);
+            if (
+                filename === 'sync-manifest.json' ||
+                filename === 'skipped-files.log' ||
+                filename.endsWith('.tmp') ||
+                manifest.has(filename)
+            ) {
+                return;
+            }
+            uploadQueue.push(filePath);
+            if (!isProcessingQueue) {
+                processUploadQueue().catch((err) =>
+                    console.error('❌ Upload queue error:', err),
+                );
+            }
+        }
+
+        // --- INIT CHOKIDAR FIRST (before history sync) to avoid EBUSY race ---
+        try {
+            const chokidar = await import('chokidar');
+            const fsWatcher = chokidar.watch(groupFolder, {
+                ignoreInitial: true,
+                ignored: (filePath) => {
+                    const base = path.basename(filePath);
+                    return (
+                        base.endsWith('.tmp') ||
+                        base === 'sync-manifest.json' ||
+                        base === 'skipped-files.log'
+                    );
+                },
+                ignorePermissionErrors: true,
+                awaitWriteFinish: {
+                    stabilityThreshold: 2000,
+                    pollInterval: 100,
+                },
+            });
+
+            fsWatcher.on('error', (error) =>
+                console.error('Chokidar Watcher error:', error),
+            );
+
+            fsWatcher.on('add', (filePath) => {
+                enqueueUpload(filePath);
+            });
+
+            fsWatcher.on('unlink', async (filePath) => {
+                const filename = path.basename(filePath);
+                if (
+                    filename === 'sync-manifest.json' ||
+                    filename === 'skipped-files.log' ||
+                    filename.endsWith('.tmp')
+                ) {
+                    return;
+                }
+                if (!manifest.has(filename)) return;
+
+                deleteQueue.push(filename);
+                if (!isProcessingDeleteQueue) {
+                    processDeleteQueue().catch((err) =>
+                        console.error('❌ Delete queue error:', err),
+                    );
+                }
+            });
+        } catch (err) {
+            console.error('❌ Failed to initialize chokidar watcher:', err);
+        }
+        // -----------------------------------------------------------------------
 
         // --- SYNC EXISTING MEDIA ---
         try {
@@ -266,196 +452,17 @@ To start watching a group, run:`);
             `✅ Startup scan complete. ${startupUploadQueue.length} files queued for upload.`,
         );
 
-        // --- UPLOAD INFRASTRUCTURE ---
-        if (isWatcherInitialized) return;
-        isWatcherInitialized = true;
-
-        const MAX_FILE_SIZE_BYTES = 64 * 1024 * 1024;
-        const uploadQueue = [...startupUploadQueue];
-        let isProcessingQueue = false;
-
-        const deleteQueue = [];
-        let isProcessingDeleteQueue = false;
-
-        async function processDeleteQueue() {
-            isProcessingDeleteQueue = true;
-            while (deleteQueue.length > 0) {
-                const filename = deleteQueue.shift();
-                const messageId = manifest.getByFilename(filename);
-                try {
-                    const msg = await client.getMessageById(messageId);
-                    if (msg) {
-                        await msg.delete(true);
-                        console.log(
-                            '🗑️ Revoked WhatsApp message for deleted file:',
-                            filename,
-                        );
-                    }
-                } catch (err) {
-                    console.error(
-                        '❌ Error revoking message for deleted file',
-                        filename,
-                        ':',
-                        err,
-                    );
-                } finally {
-                    manifest.delete(filename);
-                    await new Promise((r) => setTimeout(r, 2000));
-                }
-            }
-            isProcessingDeleteQueue = false;
-        }
-
-        async function processUploadQueue() {
-            isProcessingQueue = true;
-            let consecutiveUploads = 0;
-            while (uploadQueue.length > 0) {
-                const filePath = uploadQueue.shift();
-                const filename = path.basename(filePath);
-
-                if (manifest.has(filename)) continue;
-                if (!fs.existsSync(filePath)) continue;
-
-                try {
-                    const stat = fs.statSync(filePath);
-                    if (stat.size > MAX_FILE_SIZE_BYTES) {
-                        fs.appendFileSync(
-                            path.join(groupFolder, 'skipped-files.log'),
-                            `${new Date().toISOString()} | SIZE_SKIP | ${filename} | ${stat.size} bytes exceeds ${MAX_FILE_SIZE_BYTES} limit\n`,
-                        );
-                        continue;
-                    }
-
-                    const media = MessageMedia.fromFilePath(filePath);
-                    let attempts = 0;
-                    let success = false;
-                    const MAX_RETRIES = 3;
-
-                    while (attempts < MAX_RETRIES && !success) {
-                        try {
-                            const sentMsg = await client.sendMessage(
-                                TARGET_GROUP_ID,
-                                media,
-                                {
-                                    caption: filename,
-                                },
-                            );
-                            manifest.set(filename, sentMsg.id._serialized);
-                            console.log('✅ Uploaded:', filename);
-                            success = true;
-                        } catch (uploadErr) {
-                            attempts++;
-                            if (attempts >= MAX_RETRIES) {
-                                throw uploadErr;
-                            }
-                            console.warn(
-                                `⚠️ Upload failed for ${filename}. Retrying (${attempts}/${MAX_RETRIES})...`,
-                            );
-                            await new Promise((r) =>
-                                setTimeout(r, Math.pow(2, attempts) * 1000),
-                            );
-                        }
-                    }
-                    consecutiveUploads++;
-                    if (
-                        consecutiveUploads % 10 === 0 &&
-                        uploadQueue.length > 0
-                    ) {
-                        console.log(
-                            `⏱️ Rate limit: Pausing for 60 seconds after ${consecutiveUploads} consecutive uploads...`,
-                        );
-                        await new Promise((r) => setTimeout(r, 60000));
-                    } else if (uploadQueue.length > 0) {
-                        if (consecutiveUploads >= 10) {
-                            await new Promise((r) => setTimeout(r, 10000));
-                        } else {
-                            await new Promise((r) => setTimeout(r, 3000));
-                        }
-                    }
-                } catch (err) {
-                    fs.appendFileSync(
-                        path.join(groupFolder, 'skipped-files.log'),
-                        `${new Date().toISOString()} | SKIP | ${filename} | ${err.message}\n`,
-                    );
-                }
-            }
-            isProcessingQueue = false;
-        }
-
-        function enqueueUpload(filePath) {
-            const filename = path.basename(filePath);
-            if (
-                filename === 'sync-manifest.json' ||
-                filename === 'skipped-files.log' ||
-                filename.endsWith('.tmp') ||
-                manifest.has(filename)
-            ) {
-                return;
-            }
-            uploadQueue.push(filePath);
+        // Enqueue offline files for upload
+        if (startupUploadQueue.length > 0) {
+            console.log(
+                `▶️ Starting upload queue with ${startupUploadQueue.length} offline files...`,
+            );
+            for (const fp of startupUploadQueue) uploadQueue.push(fp);
             if (!isProcessingQueue) {
                 processUploadQueue().catch((err) =>
-                    console.error('❌ Upload queue error:', err),
+                    console.error('❌ Startup upload queue error:', err),
                 );
             }
-        }
-
-        if (uploadQueue.length > 0 && !isProcessingQueue) {
-            console.log(
-                `▶️ Starting upload queue with ${uploadQueue.length} offline files...`,
-            );
-            processUploadQueue(groupFolder).catch((err) =>
-                console.error('❌ Startup upload queue error:', err),
-            );
-        }
-
-        try {
-            const chokidar = await import('chokidar');
-            const fsWatcher = chokidar.watch(groupFolder, {
-                ignoreInitial: true,
-                ignored: (filePath) => {
-                    const base = path.basename(filePath);
-                    return (
-                        base.endsWith('.tmp') ||
-                        base === 'sync-manifest.json' ||
-                        base === 'skipped-files.log'
-                    );
-                },
-                ignorePermissionErrors: true,
-                awaitWriteFinish: {
-                    stabilityThreshold: 2000,
-                    pollInterval: 100,
-                },
-            });
-
-            fsWatcher.on('error', (error) =>
-                console.error('Chokidar Watcher error:', error),
-            );
-
-            fsWatcher.on('add', (filePath) => {
-                enqueueUpload(filePath);
-            });
-
-            fsWatcher.on('unlink', async (filePath) => {
-                const filename = path.basename(filePath);
-                if (
-                    filename === 'sync-manifest.json' ||
-                    filename === 'skipped-files.log' ||
-                    filename.endsWith('.tmp')
-                ) {
-                    return;
-                }
-                if (!manifest.has(filename)) return;
-
-                deleteQueue.push(filename);
-                if (!isProcessingDeleteQueue) {
-                    processDeleteQueue().catch((err) =>
-                        console.error('❌ Delete queue error:', err),
-                    );
-                }
-            });
-        } catch (err) {
-            console.error('❌ Failed to initialize chokidar watcher:', err);
         }
 
         console.log('Waiting for new media messages...');
@@ -508,12 +515,13 @@ client.on('message_create', async (msg) => {
     if (msg.hasMedia) {
         if (
             msg.id.fromMe &&
-            manifest &&
-            manifest.getByMessageId(msg.id._serialized)
+            (pendingUploadIds.has(msg.id._serialized) ||
+                (manifest && manifest.getByMessageId(msg.id._serialized)))
         ) {
             console.log(
                 `🔄 Ignoring echo of our own upload: ${msg.id._serialized}`,
             );
+            pendingUploadIds.delete(msg.id._serialized);
             return;
         }
         try {
