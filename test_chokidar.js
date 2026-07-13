@@ -2,10 +2,14 @@ const chokidar = require('chokidar');
 const fs = require('fs');
 const path = require('path');
 
-const dir = path.join(__dirname, 'test-watch');
-if (!fs.existsSync(dir)) fs.mkdirSync(dir);
+const basePath = path.join(process.env.USERPROFILE || process.env.HOME, 'Documents', 'syncstaging');
+const OUT_DIR = path.join(basePath, 'out');
 
-const watcher = chokidar.watch(dir, {
+if (!fs.existsSync(OUT_DIR)) fs.mkdirSync(OUT_DIR, { recursive: true });
+
+console.log(`Test script will watch OUT_DIR: ${OUT_DIR}`);
+
+const watcher = chokidar.watch(OUT_DIR, {
     ignoreInitial: true,
     awaitWriteFinish: {
         stabilityThreshold: 2000,
@@ -13,28 +17,35 @@ const watcher = chokidar.watch(dir, {
     }
 });
 
-watcher.on('add', p => console.log('added', p));
+watcher.on('add', p => console.log('✅ File ready to be uploaded:', p));
+watcher.on('unlink', p => console.log('🗑️ File deleted (presumably uploaded):', p));
 watcher.on('error', e => console.error('watcher error:', e));
 
 setTimeout(() => {
-    console.log('simulating large file write...');
-    // In node, we can simulate a large locked write by opening a file and writing slowly.
-    const fd = fs.openSync(path.join(dir, 'large.bin'), 'w');
-    // Write 70 MB
-    const buf = Buffer.alloc(1024 * 1024);
+    console.log('Simulating a file write in OUT_DIR...');
+    
+    // Simulate writing a file to OUT_DIR over a few seconds
+    const targetFile = path.join(OUT_DIR, 'test_upload.bin');
+    const fd = fs.openSync(targetFile, 'w');
+    
+    const buf = Buffer.alloc(1024 * 1024); // 1MB buffer
     let written = 0;
+    
     const interval = setInterval(() => {
         fs.writeSync(fd, buf, 0, buf.length, null);
         written++;
-        console.log('wrote MB', written);
-        if (written > 70) {
+        console.log(`Wrote ${written} MB...`);
+        
+        if (written > 5) { // 5 MB test file
             clearInterval(interval);
             fs.closeSync(fd);
-            console.log('done writing');
+            console.log('Done writing test file.');
+            
             setTimeout(() => {
                 watcher.close();
+                console.log('Test complete. In a real run, watcher.js would upload this and delete it.');
                 process.exit(0);
-            }, 3000);
+            }, 5000);
         }
-    }, 50); // write 1 MB every 50ms (20 MB/s), takes ~3.5s
+    }, 500); // write 1 MB every 500ms
 }, 1000);

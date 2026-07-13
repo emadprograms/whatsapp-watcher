@@ -2,11 +2,9 @@ const { Client, LocalAuth, MessageMedia } = require('./index');
 const qrcode = require('qrcode-terminal');
 const fs = require('fs');
 const path = require('path');
-require('dotenv').config();
+const chokidar = require('chokidar');
 const mime = require('mime');
-
-// ... (existing imports)
-const SyncManifest = require('./src/SyncManifest');
+require('dotenv').config();
 
 // === GLOBAL ERROR HANDLING ===
 process.on('uncaughtException', (err) => {
@@ -17,29 +15,22 @@ process.on('unhandledRejection', (reason, promise) => {
     console.error('⚠️ Unhandled Rejection at:', promise, 'reason:', reason);
 });
 
-// === HELPERS ===
-// ... (existing helpers)
+// === DIRECTORY SETUP ===
+const basePath = path.join(process.env.USERPROFILE || process.env.HOME, 'Documents', 'syncstaging');
+const IN_DIR = path.join(basePath, 'in');
+const OUT_DIR = path.join(basePath, 'out');
 
-// === CONFIGURATION ===
-// You can set this via environment variable: GROUP_ID=123456789@g.us node watcher.js
-const TARGET_GROUP_ID = process.env.GROUP_ID;
-const DOWNLOADS_DIR = path.join(__dirname, 'sync_download');
+if (!fs.existsSync(IN_DIR)) fs.mkdirSync(IN_DIR, { recursive: true });
+if (!fs.existsSync(OUT_DIR)) fs.mkdirSync(OUT_DIR, { recursive: true });
 
-let manifest = null;
-let isWatcherInitialized = false;
-let groupFolder = null;
-const uploadingFiles = new Set(); // Tracks captions/filenames actively being uploaded
-
-if (!fs.existsSync(DOWNLOADS_DIR)) {
-    fs.mkdirSync(DOWNLOADS_DIR);
-}
+let sendMeGroupId = null;
+let receiveMeGroupId = null;
 
 const client = new Client({
     authStrategy: new LocalAuth(),
     puppeteer: {
         headless: true,
-        executablePath:
-            'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
+        executablePath: 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
         args: [
             '--no-sandbox',
             '--disable-setuid-sandbox',
@@ -49,7 +40,7 @@ const client = new Client({
     },
 });
 
-// Graceful shutdown: kill browser when user presses Ctrl+C
+// Graceful shutdown
 process.on('SIGINT', async () => {
     console.log('\n🛑 Stopping watcher...');
     if (client) {
@@ -65,29 +56,6 @@ client.on('qr', (qr) => {
 
 client.on('authenticated', () => {
     console.log('Successfully authenticated!');
-
-    // Watchdog to track progress towards 'ready'
-    const watchdog = setInterval(async () => {
-        try {
-            const page = client.pupPage;
-            if (page) {
-                const title = await page.title();
-                const url = page.url();
-                console.log(
-                    `🕒 Watchdog: Page Title: "${title}" | URL: ${url}`,
-                );
-            }
-        } catch (e) {
-            console.log(
-                '🕒 Watchdog: Waiting for page to be available...',
-                e.message,
-            );
-        }
-    }, 5000);
-
-    client.on('ready', () => {
-        clearInterval(watchdog);
-    });
 });
 
 client.on('auth_failure', (msg) => {
@@ -101,505 +69,110 @@ client.on('disconnected', (reason) => {
 client.on('ready', async () => {
     console.log('Client is ready!');
 
-    if (!TARGET_GROUP_ID) {
-        console.log(`
-⚠️  No TARGET_GROUP_ID provided.`);
-        console.log('Listing your groups so you can find the ID:');
-        console.log('--------------------------------------------------');
-        const chats = await client.getChats();
-        const groups = chats.filter((chat) => chat.isGroup);
+    const chats = await client.getChats();
+    const groups = chats.filter((chat) => chat.isGroup);
 
-        groups.forEach((group) => {
-            console.log(`Name: ${group.name} | ID: ${group.id._serialized}`);
-        });
-        console.log('--------------------------------------------------');
-        console.log(`
-To start watching a group, run:`);
-        console.log(`GROUP_ID=your_group_id_here node watcher.js`);
-        process.exit(0);
-    } else {
-        console.log(`Watching group: ${TARGET_GROUP_ID}`);
+    const sendMeGroup = groups.find(g => g.name.toLowerCase() === 'send me');
+    const receiveMeGroup = groups.find(g => g.name.toLowerCase() === 'receive me');
 
-        groupFolder = DOWNLOADS_DIR;
-        if (!fs.existsSync(groupFolder))
-            fs.mkdirSync(groupFolder, { recursive: true });
-        manifest = new SyncManifest(
-            path.join(groupFolder, 'sync-manifest.json'),
-        );
-
-        // --- UPLOAD INFRASTRUCTURE ---
-        if (isWatcherInitialized) return;
-        isWatcherInitialized = true;
-
-        const MAX_FILE_SIZE_BYTES = 64 * 1024 * 1024;
-        const uploadQueue = [];
-        let isProcessingQueue = false;
-
-        const deleteQueue = [];
-        let isProcessingDeleteQueue = false;
-
-        async function processDeleteQueue() {
-            isProcessingDeleteQueue = true;
-            while (deleteQueue.length > 0) {
-                const filename = deleteQueue.shift();
-                const messageId = manifest.getByFilename(filename);
-                if (!messageId) {
-                    // Already cleaned from manifest (e.g. by startup reverse-check) — skip
-                    manifest.delete(filename);
-                    continue;
-                }
-                try {
-                    const msg = await client.getMessageById(messageId);
-                    if (msg) {
-                        await msg.delete(true);
-                        console.log(
-                            '🗑️ Revoked WhatsApp message for deleted file:',
-                            filename,
-                        );
-                    }
-                } catch (err) {
-                    console.error(
-                        '❌ Error revoking message for deleted file',
-                        filename,
-                        ':',
-                        err,
-                    );
-                } finally {
-                    manifest.delete(filename);
-                    // Add a 1s delay because WhatsApp Web's internal anti-spam
-                    // will silently drop revocation requests if sent with 0ms delay.
-                    await new Promise((r) => setTimeout(r, 1000));
-                }
-            }
-            isProcessingDeleteQueue = false;
-        }
-
-        async function processUploadQueue() {
-            isProcessingQueue = true;
-            let consecutiveUploads = 0;
-            while (uploadQueue.length > 0) {
-                const filePath = uploadQueue.shift();
-                const filename = path.basename(filePath);
-
-                if (manifest.has(filename)) continue;
-                if (!fs.existsSync(filePath)) continue;
-
-                try {
-                    const stat = fs.statSync(filePath);
-                    if (stat.size > MAX_FILE_SIZE_BYTES) {
-                        fs.appendFileSync(
-                            path.join(groupFolder, 'skipped-files.log'),
-                            `${new Date().toISOString()} | SIZE_SKIP | ${filename} | ${stat.size} bytes exceeds ${MAX_FILE_SIZE_BYTES} limit\n`,
-                        );
-                        continue;
-                    }
-
-                    const media = MessageMedia.fromFilePath(filePath);
-                    let attempts = 0;
-                    let success = false;
-                    const MAX_RETRIES = 3;
-
-                    while (attempts < MAX_RETRIES && !success) {
-                        try {
-                            uploadingFiles.add(filename);
-                            const sentMsg = await client.sendMessage(
-                                TARGET_GROUP_ID,
-                                media,
-                                {
-                                    caption: filename,
-                                },
-                            );
-                            // Rename local file to match download naming convention
-                            // (uniqueId_filename) so existsSync guard blocks any echo download
-                            const uniquePrefix = sentMsg.id.id.slice(-5);
-                            const newFilename = `${uniquePrefix}_${filename}`;
-                            const newFilePath = path.join(
-                                groupFolder,
-                                newFilename,
-                            );
-                            try {
-                                fs.renameSync(filePath, newFilePath);
-                                manifest.set(
-                                    newFilename,
-                                    sentMsg.id._serialized,
-                                );
-                            } catch (renameErr) {
-                                console.warn(
-                                    `⚠️ Could not rename ${filename} to ${newFilename}:`,
-                                    renameErr.message,
-                                );
-                                manifest.set(filename, sentMsg.id._serialized);
-                            }
-                            console.log(
-                                `✅ Uploaded: ${filename} → saved as ${newFilename}`,
-                            );
-                            success = true;
-                        } catch (uploadErr) {
-                            attempts++;
-                            if (attempts >= MAX_RETRIES) {
-                                throw uploadErr;
-                            }
-                            console.warn(
-                                `⚠️ Upload failed for ${filename}. Retrying (${attempts}/${MAX_RETRIES})...`,
-                            );
-                            await new Promise((r) =>
-                                setTimeout(r, Math.pow(2, attempts) * 1000),
-                            );
-                        } finally {
-                            if (success || attempts >= MAX_RETRIES) {
-                                uploadingFiles.delete(filename);
-                            }
-                        }
-                    }
-                    consecutiveUploads++;
-                    if (
-                        consecutiveUploads % 10 === 0 &&
-                        uploadQueue.length > 0
-                    ) {
-                        console.log(
-                            `⏱️ Rate limit: Pausing for 60 seconds after ${consecutiveUploads} consecutive uploads...`,
-                        );
-                        await new Promise((r) => setTimeout(r, 60000));
-                    } else if (uploadQueue.length > 0) {
-                        if (consecutiveUploads >= 10) {
-                            await new Promise((r) => setTimeout(r, 10000));
-                        } else {
-                            await new Promise((r) => setTimeout(r, 3000));
-                        }
-                    }
-                } catch (err) {
-                    fs.appendFileSync(
-                        path.join(groupFolder, 'skipped-files.log'),
-                        `${new Date().toISOString()} | SKIP | ${filename} | ${err.message}\n`,
-                    );
-                }
-            }
-            isProcessingQueue = false;
-        }
-
-        function enqueueUpload(filePath) {
-            const filename = path.basename(filePath);
-            if (
-                filename === 'sync-manifest.json' ||
-                filename === 'skipped-files.log' ||
-                filename.endsWith('.tmp') ||
-                manifest.has(filename)
-            ) {
-                return;
-            }
-            uploadQueue.push(filePath);
-            if (!isProcessingQueue) {
-                processUploadQueue().catch((err) =>
-                    console.error('❌ Upload queue error:', err),
-                );
-            }
-        }
-
-        // --- INIT CHOKIDAR FIRST (before history sync) to avoid EBUSY race ---
-        try {
-            const chokidar = await import('chokidar');
-            const fsWatcher = chokidar.watch(groupFolder, {
-                ignoreInitial: true,
-                ignored: (filePath) => {
-                    const base = path.basename(filePath);
-                    return (
-                        base.endsWith('.tmp') ||
-                        base === 'sync-manifest.json' ||
-                        base === 'skipped-files.log'
-                    );
-                },
-                ignorePermissionErrors: true,
-                awaitWriteFinish: {
-                    stabilityThreshold: 2000,
-                    pollInterval: 100,
-                },
-            });
-
-            fsWatcher.on('error', (error) =>
-                console.error('Chokidar Watcher error:', error),
-            );
-
-            fsWatcher.on('add', (filePath) => {
-                enqueueUpload(filePath);
-            });
-
-            fsWatcher.on('unlink', async (filePath) => {
-                const filename = path.basename(filePath);
-                if (
-                    filename === 'sync-manifest.json' ||
-                    filename === 'skipped-files.log' ||
-                    filename.endsWith('.tmp')
-                ) {
-                    return;
-                }
-                if (!manifest.has(filename)) return;
-
-                deleteQueue.push(filename);
-                if (!isProcessingDeleteQueue) {
-                    processDeleteQueue().catch((err) =>
-                        console.error('❌ Delete queue error:', err),
-                    );
-                }
-            });
-        } catch (err) {
-            console.error('❌ Failed to initialize chokidar watcher:', err);
-        }
-        // -----------------------------------------------------------------------
-
-        // --- SYNC EXISTING MEDIA ---
-        try {
-            console.log('🔄 Syncing recent media from group history...');
-            const chat = await client.getChatById(TARGET_GROUP_ID);
-            const messages = await chat.fetchMessages({ limit: 1000 });
-
-            let downloadedCount = 0;
-            for (const msg of messages) {
-                if (msg.hasMedia) {
-                    if (manifest.getByMessageId(msg.id._serialized)) continue;
-                    const media = await msg.downloadMedia();
-                    if (media) {
-                        let baseFilename = media.filename;
-                        const mimetypeStr = media.mimetype
-                            ? media.mimetype.split(';')[0]
-                            : '';
-                        const ext = mime.getExtension(mimetypeStr) || 'bin';
-
-                        if (!baseFilename) {
-                            baseFilename = `download.${ext}`;
-                        } else if (!baseFilename.includes('.')) {
-                            baseFilename = `${baseFilename}.${ext}`;
-                        }
-
-                        const uniqueId = msg.id.id.slice(-5);
-                        const filename = `${uniqueId}_${baseFilename}`;
-                        const filePath = path.join(groupFolder, filename);
-
-                        if (
-                            !fs.existsSync(filePath) &&
-                            !manifest.has(filename)
-                        ) {
-                            fs.writeFileSync(filePath + '.tmp', media.data, {
-                                encoding: 'base64',
-                            });
-                            manifest.set(filename, msg.id._serialized);
-                            fs.renameSync(filePath + '.tmp', filePath);
-                            downloadedCount++;
-                        }
-                    }
-                } else if (
-                    msg.type === 'revoked' ||
-                    msg.type === 'chat_msg_revoked'
-                ) {
-                    const filename = manifest.getByMessageId(
-                        msg.id._serialized,
-                    );
-                    if (filename) {
-                        const filePath = path.join(groupFolder, filename);
-                        if (fs.existsSync(filePath)) {
-                            try {
-                                fs.unlinkSync(filePath);
-                            } catch (err) {
-                                console.error(
-                                    'Error deleting offline revoked file:',
-                                    err,
-                                );
-                            }
-                        }
-                        manifest.delete(filename);
-                        console.log(
-                            '🗑️ Deleted local file for offline revoked message:',
-                            filename,
-                        );
-                    }
-                }
-            }
-            console.log(
-                `✅ Sync complete. Downloaded ${downloadedCount} existing media files.`,
-            );
-        } catch (err) {
-            console.error('❌ Error syncing group history:', err);
-        }
-        // ---------------------------
-
-        // --- STARTUP SCAN (Offline Changes) ---
-        console.log('🔍 Scanning for offline changes...');
-        const startupUploadQueue = [];
-
-        // 1a. Detect offline file deletions (Tracked in manifest but missing locally)
-        for (const [filename, messageId] of manifest.entries()) {
-            if (!fs.existsSync(path.join(groupFolder, filename))) {
-                try {
-                    const msg = await client.getMessageById(messageId);
-                    if (msg) {
-                        await msg.delete(true);
-                        console.log(
-                            '🗑️ Revoked orphan message for deleted file:',
-                            filename,
-                        );
-                    }
-                } catch (err) {
-                    console.error(
-                        '❌ Error processing offline deletion for',
-                        filename,
-                        ':',
-                        err.message,
-                    );
-                } finally {
-                    manifest.delete(filename);
-                }
-            }
-        }
-
-        // 1b. Reverse-check: verify each manifest entry still exists on WhatsApp
-        // Reverse-check disabled to prevent severe API spam
-
-        // 2. Detect offline file additions (Local files not tracked in manifest)
-        const localFiles = fs.readdirSync(groupFolder);
-        for (const filename of localFiles) {
-            if (
-                filename === 'sync-manifest.json' ||
-                filename === 'skipped-files.log' ||
-                filename.endsWith('.tmp') ||
-                manifest.has(filename)
-            ) {
-                continue;
-            }
-            startupUploadQueue.push(path.join(groupFolder, filename));
-            console.log('📤 Queued untracked local file for upload:', filename);
-        }
-        console.log(
-            `✅ Startup scan complete. ${startupUploadQueue.length} files queued for upload.`,
-        );
-
-        // Enqueue offline files for upload
-        if (startupUploadQueue.length > 0) {
-            console.log(
-                `▶️ Starting upload queue with ${startupUploadQueue.length} offline files...`,
-            );
-            for (const fp of startupUploadQueue) uploadQueue.push(fp);
-            if (!isProcessingQueue) {
-                processUploadQueue().catch((err) =>
-                    console.error('❌ Startup upload queue error:', err),
-                );
-            }
-        }
-
-        console.log('Waiting for new media messages...');
+    if (!sendMeGroup || !receiveMeGroup) {
+        console.error('❌ Could not find "send me" or "receive me" groups.');
+        console.log('Available groups:');
+        groups.forEach(g => console.log(` - ${g.name} (ID: ${g.id._serialized})`));
+        process.exit(1);
     }
+
+    sendMeGroupId = sendMeGroup.id._serialized;
+    receiveMeGroupId = receiveMeGroup.id._serialized;
+
+    console.log(`✅ Bound to "send me" group: ${sendMeGroupId}`);
+    console.log(`✅ Bound to "receive me" group: ${receiveMeGroupId}`);
+    console.log(`📂 Monitoring OUT_DIR: ${OUT_DIR}`);
+    console.log(`📂 Saving to IN_DIR: ${IN_DIR}`);
+
+    // --- SETUP CHOKIDAR ON OUT DIRECTORY ---
+    const fsWatcher = chokidar.watch(OUT_DIR, {
+        ignoreInitial: true,
+        awaitWriteFinish: {
+            stabilityThreshold: 2000,
+            pollInterval: 100,
+        },
+    });
+
+    fsWatcher.on('error', (error) => console.error('Chokidar Watcher error:', error));
+
+    fsWatcher.on('add', async (filePath) => {
+        try {
+            const filename = path.basename(filePath);
+            console.log(`📤 Uploading file: ${filename}`);
+            
+            // Skip temporary or hidden files
+            if (filename.startsWith('.') || filename.endsWith('.tmp')) return;
+
+            const media = MessageMedia.fromFilePath(filePath);
+            
+            // Upload to receive me group
+            await client.sendMessage(receiveMeGroupId, media, { caption: filename });
+            console.log(`✅ Uploaded to WhatsApp: ${filename}`);
+            
+            // Delete from out folder
+            fs.unlinkSync(filePath);
+            console.log(`🗑️ Deleted from out folder: ${filename}`);
+            
+        } catch (err) {
+            console.error(`❌ Failed to upload ${filePath}:`, err);
+        }
+    });
 });
 
-async function handleRevocation(msg, revokedMsg) {
-    if (msg.from !== TARGET_GROUP_ID && msg.to !== TARGET_GROUP_ID) return;
-
-    const messageId = msg.id._serialized;
-    let filename = manifest.getByMessageId(messageId);
-
-    if (!filename && revokedMsg) {
-        filename = manifest.getByMessageId(revokedMsg.id._serialized);
-    }
-
-    if (!filename) return;
-
-    const filePath = path.join(groupFolder, filename);
-    try {
-        if (fs.existsSync(filePath)) {
-            fs.unlinkSync(filePath);
-            console.log('🗑️ Deleted local file for revoked message:', filename);
-        }
-    } catch (err) {
-        console.error(
-            '❌ Error deleting local file for revoked message',
-            filename,
-            ':',
-            err,
-        );
-    } finally {
-        manifest.delete(filename);
-    }
-}
-
-client.on('message_revoke_everyone', handleRevocation);
-client.on('message_revoke_me', handleRevocation);
-
 client.on('message_create', async (msg) => {
-    console.log(
-        `📩 Incoming message from: ${msg.from} | to: ${msg.to} | Has Media: ${msg.hasMedia}`,
-    );
-
-    // Only process messages from/to the target group
-    if (msg.from !== TARGET_GROUP_ID && msg.to !== TARGET_GROUP_ID) {
+    // Only process messages in the "send me" group
+    if (msg.from !== sendMeGroupId && msg.to !== sendMeGroupId) {
         return;
     }
 
     if (msg.hasMedia) {
-        // Deterministic guard for the exact window of the upload race condition.
-        // If an echo arrives while we are awaiting sendMessage(), its caption
-        // will exactly match the filename in uploadingFiles.
-        if (msg.id.fromMe && msg.body && uploadingFiles.has(msg.body)) {
-            console.log(
-                `🔄 Ignoring echo of actively uploading file: ${msg.body}`,
-            );
-            return;
-        }
-
-        if (
-            msg.id.fromMe &&
-            manifest &&
-            manifest.getByMessageId(msg.id._serialized)
-        ) {
-            console.log(
-                `🔄 Ignoring echo of our own upload: ${msg.id._serialized}`,
-            );
-            return;
-        }
         try {
-            console.log(`Detected media from ${msg.from}. Downloading...`);
+            console.log(`📩 Detected media in "send me" group. Downloading...`);
             const media = await msg.downloadMedia();
 
             if (media) {
-                if (!fs.existsSync(groupFolder)) {
-                    fs.mkdirSync(groupFolder, { recursive: true });
-                }
-
-                let baseFilename = media.filename;
-                const mimetypeStr = media.mimetype
-                    ? media.mimetype.split(';')[0]
-                    : '';
+                const mimetypeStr = media.mimetype ? media.mimetype.split(';')[0] : '';
                 const ext = mime.getExtension(mimetypeStr) || 'bin';
-
+                
+                let baseFilename = media.filename;
                 if (!baseFilename) {
-                    baseFilename = `download.${ext}`;
+                    baseFilename = `download_${msg.id.id.slice(-5)}.${ext}`;
                 } else if (!baseFilename.includes('.')) {
                     baseFilename = `${baseFilename}.${ext}`;
                 }
 
-                const uniqueId = msg.id.id.slice(-5);
-                const filename = `${uniqueId}_${baseFilename}`;
-                const filePath = path.join(groupFolder, filename);
-
-                // Skip if already present locally (echo from our own upload)
-                if (
-                    fs.existsSync(filePath) ||
-                    (manifest && manifest.has(filename))
-                ) {
-                    console.log(
-                        `⏭️ Skipping already-present file: ${filename}`,
-                    );
-                    return;
+                // If file already exists in IN_DIR, prepend timestamp
+                let filePath = path.join(IN_DIR, baseFilename);
+                if (fs.existsSync(filePath)) {
+                    baseFilename = `${Date.now()}_${baseFilename}`;
+                    filePath = path.join(IN_DIR, baseFilename);
                 }
 
-                fs.writeFileSync(filePath + '.tmp', media.data, {
-                    encoding: 'base64',
-                });
-                if (manifest) {
-                    manifest.set(filename, msg.id._serialized);
-                }
-                fs.renameSync(filePath + '.tmp', filePath);
+                fs.writeFileSync(filePath, media.data, { encoding: 'base64' });
+                console.log(`✅ Saved to IN_DIR: ${filePath}`);
 
-                console.log(`✅ Saved: ${filePath}`);
+                // Attempt to delete message from WhatsApp
+                // Use true to delete for everyone, false for me. Some messages can't be deleted for everyone.
+                try {
+                    await msg.delete(true);
+                    console.log(`🗑️ Revoked message for everyone from WhatsApp`);
+                } catch (delErr) {
+                    try {
+                        await msg.delete(false);
+                        console.log(`🗑️ Deleted message for me from WhatsApp`);
+                    } catch (delMeErr) {
+                        console.warn(`⚠️ Could not delete message from WhatsApp:`, delMeErr.message);
+                    }
+                }
             }
         } catch (err) {
-            console.error('❌ Failed to download media:', err);
+            console.error('❌ Failed to process incoming media:', err);
         }
     }
 });
