@@ -318,3 +318,21 @@ client.on('message_create', async (msg) => {
 });
 
 client.initialize();
+
+// --- GRACEFUL SHUTDOWN ---
+// This ensures that when you stop the script (Ctrl+C), it properly closes
+// the hidden Chrome browser so it doesn't leave orphaned processes behind!
+async function gracefulShutdown() {
+    console.log('\n🛑 Shutting down gracefully... Closing Chrome browser...');
+    try {
+        await client.destroy();
+        console.log('✅ Browser closed safely.');
+    } catch (ignoredError) {
+        // Ignore errors during shutdown
+    }
+    process.exit(0);
+}
+
+process.on('SIGINT', gracefulShutdown);
+process.on('SIGTERM', gracefulShutdown);
+process.on('SIGQUIT', gracefulShutdown);
